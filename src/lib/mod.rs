@@ -1,9 +1,13 @@
+use std::num::NonZeroU32;
+
 use wgpu::{include_wgsl, util::DeviceExt};
 use winit::{
     event::*,
     event_loop::{ControlFlow, EventLoop},
     window::{Window, WindowBuilder},
 };
+
+mod texture;
 
 struct State {
     surface: wgpu::Surface,
@@ -15,7 +19,15 @@ struct State {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     num_indices: u32,
-    diffuse_bind_group: wgpu::BindGroup
+    diffuse_bind_group: wgpu::BindGroup,
+    diffuse_texture: texture::Texture,
+
+    compute_update_agents: wgpu::ComputePipeline,
+    compute_draw_agents: wgpu::ComputePipeline,
+    compute_dim_texture: wgpu::ComputePipeline,
+    texture_rw_bind_group: wgpu::BindGroup,
+    agents_rw_bind_group: wgpu::BindGroup,
+    agents_buffer: wgpu::Buffer
 }
 
 #[repr(C)]
@@ -37,18 +49,23 @@ impl Vertex {
     }
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct Agent {
+    position: [f32; 2],
+    direction: f32
+}
+
 const VERTICES: &[Vertex] = &[
-    Vertex { position: [-0.0868241, 0.49240386, 0.0], tex_coords: [0.4131759, 0.99240386], }, // A
-    Vertex { position: [-0.49513406, 0.06958647, 0.0], tex_coords: [0.0048659444, 0.56958647], }, // B
-    Vertex { position: [-0.21918549, -0.44939706, 0.0], tex_coords: [0.28081453, 0.05060294], }, // C
-    Vertex { position: [0.35966998, -0.3473291, 0.0], tex_coords: [0.85967, 0.1526709], }, // D
-    Vertex { position: [0.44147372, 0.2347359, 0.0], tex_coords: [0.9414737, 0.7347359], }, // E
+    Vertex { position: [-1.0,  1.0, 0.0], tex_coords: [0.0, 0.0], }, // A
+    Vertex { position: [-1.0, -1.0, 0.0], tex_coords: [0.0, 1.0], }, // B
+    Vertex { position: [ 1.0, -1.0, 0.0], tex_coords: [1.0, 1.0], }, // C
+    Vertex { position: [ 1.0,  1.0, 0.0], tex_coords: [1.0, 0.0], }, // D
 ];
 
 const INDICES: &[u16] = &[
-    0, 1, 4,
-    1, 2, 4,
-    2, 3, 4,
+    0, 1, 2,
+    2, 3, 0
 ];
 
 impl State {
@@ -69,7 +86,7 @@ impl State {
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
-                    features: wgpu::Features::empty(),
+                    features: wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES,
                     limits: wgpu::Limits::default(),
                     label: None,
                 },
@@ -87,70 +104,37 @@ impl State {
         };
         surface.configure(&device, &config);
 
-        let texture_size = wgpu::Extent3d {
-            width: 400,
-            height: 400,
-            depth_or_array_layers: 1
-        };
-        let diffuse_texture = device.create_texture(
-            &wgpu::TextureDescriptor {
-                size: texture_size,
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                label: Some("Texture")
-            }
-        );
-
-        let texture_data: Vec<_> = (0..400*400).map(|x| [x % 400, x / 400]).map(|[x, y]| [x-200, y-200]).map(|[dx, dy]| ((dx*dx + dy*dy) as f32).sqrt()).map(|x| x.min(255.0) as u8).flat_map(|x| [x, x, x, 255]).collect();
-        queue.write_texture(
-            wgpu::ImageCopyTexture {
-                texture: &diffuse_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All
-            },
-            &texture_data,
-            wgpu::ImageDataLayout {
-                offset: 0,
-                bytes_per_row: std::num::NonZeroU32::new(4 * 400),
-                rows_per_image: std::num::NonZeroU32::new(400)
-            },
-            texture_size
-        );
-
-        let diffuse_texture_view = diffuse_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let diffuse_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::FilterMode::Nearest,
-            ..Default::default()
+        let agents: Vec<_> = (0..128).map(|x| Agent { position: [128.0, 128.0], direction: x as f32 }).collect();
+        let agents_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Agent Buffer"),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
+            contents: bytemuck::cast_slice(&agents)
         });
+
+        let texture_data: Vec<_> = (0..256*256).flat_map(|_| [0, 0, 0, 255]).collect();
+        let diffuse_texture = texture::Texture::from_raw_bytes(&device, &queue, texture_data, 256, 256, "Some Texture").unwrap();
+
+        let output_view = diffuse_texture.texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         let texture_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
                         view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false
                     },
                     count: None
                 },
                 wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        // This should match the filterable field of the
-                        // corresponding Texture entry above.
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
+                    // This should match the filterable field of the
+                    // corresponding Texture entry above.
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
+                    count: None,
                 },
             ],
             label: Some("Texture Bind Group")
@@ -161,18 +145,67 @@ impl State {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&diffuse_texture_view)
+                    resource: wgpu::BindingResource::TextureView(&diffuse_texture.view)
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&diffuse_sampler)
+                    resource: wgpu::BindingResource::Sampler(&diffuse_texture.sampler)
                 }
             ],
             label: Some("Diffuse Bind Group")
         });
 
+        let texture_rw_bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { 
+            label: Some("Compute Bind Group Layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture { access: wgpu::StorageTextureAccess::ReadWrite, format: wgpu::TextureFormat::Rgba8Unorm, view_dimension: wgpu::TextureViewDimension::D2 },
+                    count: None
+                }
+            ]
+        });
 
-        let shader = device.create_shader_module(include_wgsl!("shader.wgsl"));
+        let agents_rw_bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { 
+            label: Some("Compute Bind Group Layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        min_binding_size: None,
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false
+                    },
+                    count: None
+                }
+            ]
+        });
+
+        let texture_rw_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &texture_rw_bind_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&output_view)
+                }
+            ],
+            label: Some("Compute Texture View")
+        });
+
+        let agents_rw_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &agents_rw_bind_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: agents_buffer.as_entire_binding()
+                }
+            ],
+            label: Some("Compute Texture View")
+        });
+
+        let shader = device.create_shader_module(include_wgsl!("./shaders/shader.wgsl"));
         let render_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Render Pipeline Layout"),
             bind_group_layouts: &[&texture_bind_group_layout],
@@ -214,6 +247,33 @@ impl State {
             multiview: None
         });
 
+        let compute_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Compute Pipeline Descriptor"),
+            bind_group_layouts: &[&texture_rw_bind_layout, &agents_rw_bind_layout],
+            push_constant_ranges: &[]
+        });
+
+        let compute_update_agents = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Update Agents"),
+            layout: Some(&compute_pipeline_layout),
+            module: &shader,
+            entry_point: "update_agents"
+        });
+
+        let compute_draw_agents = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Draw Agents"),
+            layout: Some(&compute_pipeline_layout),
+            module: &shader,
+            entry_point: "draw_agents"
+        });
+
+        let compute_dim_texture = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Dim Texture"),
+            layout: Some(&compute_pipeline_layout),
+            module: &shader,
+            entry_point: "dim_texture"
+        });
+
         let vertex_buffer = device.create_buffer_init(
             &wgpu::util::BufferInitDescriptor {
                 label: Some("Vertex Buffer"),
@@ -240,7 +300,14 @@ impl State {
             vertex_buffer,
             index_buffer,
             num_indices,
-            diffuse_bind_group
+            diffuse_bind_group,
+            diffuse_texture,
+            compute_update_agents,
+            compute_draw_agents,
+            compute_dim_texture,
+            texture_rw_bind_group,
+            agents_rw_bind_group,
+            agents_buffer
         }
     }
 
@@ -258,6 +325,46 @@ impl State {
     }
 
     fn update(&mut self) {
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Render Encoder")
+        });
+
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("Agents update pass")
+        });
+
+        pass.set_pipeline(&self.compute_update_agents);
+        pass.set_bind_group(0, &self.texture_rw_bind_group, &[]);
+        pass.set_bind_group(1, &self.agents_rw_bind_group, &[]);
+        pass.dispatch_workgroups(128, 1, 1);
+
+        drop(pass);
+
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("Agents draw pass")
+        });
+
+        pass.set_pipeline(&self.compute_draw_agents);
+        pass.set_bind_group(0, &self.texture_rw_bind_group, &[]);
+        pass.set_bind_group(1, &self.agents_rw_bind_group, &[]);
+        pass.dispatch_workgroups(128, 1, 1);
+
+        drop(pass);
+
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("Agents draw pass")
+        });
+
+        pass.set_pipeline(&self.compute_dim_texture);
+        pass.set_bind_group(0, &self.texture_rw_bind_group, &[]);
+        pass.set_bind_group(1, &self.agents_rw_bind_group, &[]);
+        pass.dispatch_workgroups(256, 256, 1);
+
+        drop(pass);
+
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
@@ -289,6 +396,8 @@ impl State {
         
         render_pass.set_pipeline(&self.render_pipeline);
         render_pass.set_bind_group(0, &self.diffuse_bind_group, &[]);
+
+
         render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
         render_pass.draw_indexed(0..self.num_indices, 0, 0..1);
@@ -305,7 +414,7 @@ impl State {
 pub async fn run() {
     env_logger::init();
     let event_loop = EventLoop::new();
-    let window = WindowBuilder::new().build(&event_loop).unwrap();
+    let window = WindowBuilder::new().with_inner_size(winit::dpi::LogicalSize::new(1024, 1024)).build(&event_loop).unwrap();
 
     let mut state = State::new(&window).await;
 
