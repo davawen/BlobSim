@@ -1,5 +1,6 @@
-use std::num::NonZeroU32;
+use std::{num::NonZeroU32, f32::consts::PI};
 
+use rand::{random, thread_rng, Rng};
 use wgpu::{include_wgsl, util::DeviceExt};
 use winit::{
     event::*,
@@ -20,12 +21,16 @@ struct State {
     index_buffer: wgpu::Buffer,
     num_indices: u32,
     diffuse_bind_group: wgpu::BindGroup,
-    diffuse_texture: texture::Texture,
+    agent_texture: texture::Texture,
+    blur_texture: texture::Texture,
 
     compute_update_agents: wgpu::ComputePipeline,
+    compute_sense_agents: wgpu::ComputePipeline,
     compute_draw_agents: wgpu::ComputePipeline,
     compute_dim_texture: wgpu::ComputePipeline,
+    compute_blur_texture: wgpu::ComputePipeline,
     texture_rw_bind_group: wgpu::BindGroup,
+    blur_texture_rw_bind_group: wgpu::BindGroup,
     agents_rw_bind_group: wgpu::BindGroup,
     agents_buffer: wgpu::Buffer
 }
@@ -68,6 +73,9 @@ const INDICES: &[u16] = &[
     2, 3, 0
 ];
 
+const NUM_AGENTS: u32 = 256;
+const TEXTURE_SIZE: u32 = 256;
+
 impl State {
     async fn new(window: &Window) -> Self {
         let size = window.inner_size();
@@ -104,17 +112,29 @@ impl State {
         };
         surface.configure(&device, &config);
 
-        let agents: Vec<_> = (0..128).map(|x| Agent { position: [128.0, 128.0], direction: x as f32 }).collect();
+        let agents: Vec<_> = (0..NUM_AGENTS).map(|_| {
+            let angle = thread_rng().gen_range(-PI..PI);
+            let x = angle.cos() * 40.0;// thread_rng().gen_range(0.0..50.0);
+            let y = angle.sin() * 20.0;// thread_rng().gen_range(0.0..50.0);
+
+            Agent { 
+                position: [ TEXTURE_SIZE as f32 / 2.0 + x, TEXTURE_SIZE as f32 / 2.0 + y],
+                direction: angle - PI/2.0
+            }
+        }).collect();
+
         let agents_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Agent Buffer"),
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
             contents: bytemuck::cast_slice(&agents)
         });
 
-        let texture_data: Vec<_> = (0..256*256).flat_map(|_| [0, 0, 0, 255]).collect();
-        let diffuse_texture = texture::Texture::from_raw_bytes(&device, &queue, texture_data, 256, 256, "Some Texture").unwrap();
+        let texture_data: Vec<_> = (0..TEXTURE_SIZE*TEXTURE_SIZE).flat_map(|_| [0, 0, 0, 255]).collect();
+        let agent_texture = texture::Texture::from_raw_bytes(&device, &queue, texture_data.clone(), TEXTURE_SIZE, TEXTURE_SIZE, "Some Texture").unwrap();
+        let blur_texture = texture::Texture::from_raw_bytes(&device, &queue, texture_data, TEXTURE_SIZE, TEXTURE_SIZE, "Some Texture").unwrap();
 
-        let output_view = diffuse_texture.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let agent_texture_view = agent_texture.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let blur_texture_view = blur_texture.texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         let texture_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             entries: &[
@@ -145,11 +165,11 @@ impl State {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&diffuse_texture.view)
+                    resource: wgpu::BindingResource::TextureView(&agent_texture.view)
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&diffuse_texture.sampler)
+                    resource: wgpu::BindingResource::Sampler(&agent_texture.sampler)
                 }
             ],
             label: Some("Diffuse Bind Group")
@@ -160,6 +180,12 @@ impl State {
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture { access: wgpu::StorageTextureAccess::ReadWrite, format: wgpu::TextureFormat::Rgba8Unorm, view_dimension: wgpu::TextureViewDimension::D2 },
+                    count: None
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::StorageTexture { access: wgpu::StorageTextureAccess::ReadWrite, format: wgpu::TextureFormat::Rgba8Unorm, view_dimension: wgpu::TextureViewDimension::D2 },
                     count: None
@@ -183,15 +209,36 @@ impl State {
             ]
         });
 
-        let texture_rw_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let descriptor = wgpu::BindGroupDescriptor {
             layout: &texture_rw_bind_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&output_view)
+                    resource: wgpu::BindingResource::TextureView(&agent_texture_view)
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&blur_texture_view)
                 }
             ],
             label: Some("Compute Texture View")
+        };
+
+        let texture_rw_bind_group = device.create_bind_group(&descriptor);
+
+        // swap descriptor entries
+        let blur_texture_rw_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&blur_texture_view)
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&agent_texture_view)
+                }
+            ],
+            ..descriptor
         });
 
         let agents_rw_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -260,6 +307,13 @@ impl State {
             entry_point: "update_agents"
         });
 
+        let compute_sense_agents = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { 
+            label: Some("Sense agents"),
+            layout: Some(&compute_pipeline_layout),
+            module: &shader,
+            entry_point: "sense_agents"
+        });
+
         let compute_draw_agents = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("Draw Agents"),
             layout: Some(&compute_pipeline_layout),
@@ -272,6 +326,13 @@ impl State {
             layout: Some(&compute_pipeline_layout),
             module: &shader,
             entry_point: "dim_texture"
+        });
+
+        let compute_blur_texture = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Dim Texture"),
+            layout: Some(&compute_pipeline_layout),
+            module: &shader,
+            entry_point: "blur_texture"
         });
 
         let vertex_buffer = device.create_buffer_init(
@@ -301,11 +362,15 @@ impl State {
             index_buffer,
             num_indices,
             diffuse_bind_group,
-            diffuse_texture,
+            agent_texture,
+            blur_texture,
             compute_update_agents,
+            compute_sense_agents,
             compute_draw_agents,
             compute_dim_texture,
+            compute_blur_texture,
             texture_rw_bind_group,
+            blur_texture_rw_bind_group,
             agents_rw_bind_group,
             agents_buffer
         }
@@ -333,37 +398,29 @@ impl State {
             label: Some("Agents update pass")
         });
 
-        pass.set_pipeline(&self.compute_update_agents);
         pass.set_bind_group(0, &self.texture_rw_bind_group, &[]);
         pass.set_bind_group(1, &self.agents_rw_bind_group, &[]);
-        pass.dispatch_workgroups(128, 1, 1);
 
-        drop(pass);
+        pass.set_pipeline(&self.compute_update_agents);
+        pass.dispatch_workgroups(NUM_AGENTS, 1, 1);
 
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("Agents draw pass")
-        });
+        pass.set_pipeline(&self.compute_sense_agents);
+        pass.dispatch_workgroups(NUM_AGENTS, 1, 1);
 
         pass.set_pipeline(&self.compute_draw_agents);
-        pass.set_bind_group(0, &self.texture_rw_bind_group, &[]);
-        pass.set_bind_group(1, &self.agents_rw_bind_group, &[]);
-        pass.dispatch_workgroups(128, 1, 1);
-
-        drop(pass);
-
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("Agents draw pass")
-        });
+        pass.dispatch_workgroups(NUM_AGENTS, 1, 1);
 
         pass.set_pipeline(&self.compute_dim_texture);
-        pass.set_bind_group(0, &self.texture_rw_bind_group, &[]);
-        pass.set_bind_group(1, &self.agents_rw_bind_group, &[]);
-        pass.dispatch_workgroups(256, 256, 1);
+        pass.dispatch_workgroups(TEXTURE_SIZE, TEXTURE_SIZE, 1);
+
+        pass.set_pipeline(&self.compute_blur_texture);
+        pass.dispatch_workgroups(TEXTURE_SIZE, TEXTURE_SIZE, 1);
 
         drop(pass);
 
         self.queue.submit(std::iter::once(encoder.finish()));
 
+        std::mem::swap(&mut self.texture_rw_bind_group, &mut self.blur_texture_rw_bind_group);
 
     }
 
