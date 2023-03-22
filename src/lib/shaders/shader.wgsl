@@ -59,9 +59,12 @@ var agent_blur_texture: texture_storage_2d<rgba8unorm, read_write>;
 @group(1) @binding(0)
 var<storage, read_write> agents: array<Agent>;
 
-@compute @workgroup_size(1)
+@compute @workgroup_size(64)
 fn update_agents(@builtin(global_invocation_id) id: vec3<u32>) {
 	let PI: f32 = 3.14159265359;
+
+	// Randomly steer
+	agents[id.x].direction += f32(hash(u32(agents[id.x].direction * 500.0) + id.x)) / 4294967295.0 * (f32(hash(u32(agents[id.x].direction * 2000.0) + id.x)) / 4294967295.0 - 0.5)*0.1;
 
 	let new_x = agents[id.x].x + cos(agents[id.x].direction);
 	let new_y = agents[id.x].y + sin(agents[id.x].direction);
@@ -124,7 +127,7 @@ fn sense_agents(@builtin(global_invocation_id) id: vec3<u32>) {
 // @group(1) @binding(0)
 // var<storage, read> agents: array<Agent>;
 
-@compute @workgroup_size(1)
+@compute @workgroup_size(64)
 fn draw_agents(@builtin(global_invocation_id) id: vec3<u32>) {
 	let dims = textureDimensions(agent_texture);
 
@@ -133,7 +136,7 @@ fn draw_agents(@builtin(global_invocation_id) id: vec3<u32>) {
 	}
 }
 
-@compute @workgroup_size(1, 1)
+@compute @workgroup_size(10, 10)
 fn dim_texture(@builtin(global_invocation_id) id: vec3<u32>) {
 	var color: vec4<f32> = textureLoad(agent_texture, vec2<i32>(id.xy));
 	color.x -= min(color.x, 0.02);
@@ -147,7 +150,7 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
 	return a + (b-a)*t;
 }
 
-@compute @workgroup_size(1, 1)
+@compute @workgroup_size(10, 10)
 fn blur_texture(@builtin(global_invocation_id) id: vec3<u32>) {
 	let id = vec2<i32>(id.xy);
 

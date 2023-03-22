@@ -73,8 +73,20 @@ const INDICES: &[u16] = &[
     2, 3, 0
 ];
 
-const NUM_AGENTS: u32 = 256;
-const TEXTURE_SIZE: u32 = 256;
+
+// Number of `cells` 
+// NOTE: Must be divisible 64
+// NOTE: Limited to 2**16 for some reason
+const NUM_AGENTS: u32 = 64000;
+
+// NOTE: Must be divisible by 10
+const TEXTURE_WIDTH: u32 = 960;
+const TEXTURE_HEIGHT: u32 = 540;
+
+const WINDOW_SCALE: u32 = 2;
+
+const WINDOW_WIDTH: u32 = TEXTURE_WIDTH * WINDOW_SCALE;
+const WINDOW_HEIGHT: u32 = TEXTURE_HEIGHT * WINDOW_SCALE;
 
 impl State {
     async fn new(window: &Window) -> Self {
@@ -115,11 +127,11 @@ impl State {
         let agents: Vec<_> = (0..NUM_AGENTS).map(|_| {
             let angle = thread_rng().gen_range(-PI..PI);
             let x = angle.cos() * 40.0;// thread_rng().gen_range(0.0..50.0);
-            let y = angle.sin() * 20.0;// thread_rng().gen_range(0.0..50.0);
+            let y = angle.sin() * 40.0;// thread_rng().gen_range(0.0..50.0);
 
             Agent { 
-                position: [ TEXTURE_SIZE as f32 / 2.0 + x, TEXTURE_SIZE as f32 / 2.0 + y],
-                direction: angle - PI/2.0
+                position: [ TEXTURE_WIDTH as f32 / 2.0 + x, TEXTURE_HEIGHT as f32 / 2.0 + y],
+                direction: angle
             }
         }).collect();
 
@@ -129,9 +141,9 @@ impl State {
             contents: bytemuck::cast_slice(&agents)
         });
 
-        let texture_data: Vec<_> = (0..TEXTURE_SIZE*TEXTURE_SIZE).flat_map(|_| [0, 0, 0, 255]).collect();
-        let agent_texture = texture::Texture::from_raw_bytes(&device, &queue, texture_data.clone(), TEXTURE_SIZE, TEXTURE_SIZE, "Some Texture").unwrap();
-        let blur_texture = texture::Texture::from_raw_bytes(&device, &queue, texture_data, TEXTURE_SIZE, TEXTURE_SIZE, "Some Texture").unwrap();
+        let texture_data: Vec<_> = (0..TEXTURE_WIDTH*TEXTURE_HEIGHT).flat_map(|_| [0, 0, 0, 255]).collect();
+        let agent_texture = texture::Texture::from_raw_bytes(&device, &queue, texture_data.clone(), TEXTURE_WIDTH, TEXTURE_HEIGHT, "Some Texture").unwrap();
+        let blur_texture = texture::Texture::from_raw_bytes(&device, &queue, texture_data, TEXTURE_WIDTH, TEXTURE_HEIGHT, "Some Texture").unwrap();
 
         let agent_texture_view = agent_texture.texture.create_view(&wgpu::TextureViewDescriptor::default());
         let blur_texture_view = blur_texture.texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -402,19 +414,19 @@ impl State {
         pass.set_bind_group(1, &self.agents_rw_bind_group, &[]);
 
         pass.set_pipeline(&self.compute_update_agents);
-        pass.dispatch_workgroups(NUM_AGENTS, 1, 1);
+        pass.dispatch_workgroups(NUM_AGENTS / 64, 1, 1);
 
         pass.set_pipeline(&self.compute_sense_agents);
-        pass.dispatch_workgroups(NUM_AGENTS, 1, 1);
+        pass.dispatch_workgroups(NUM_AGENTS / 64, 1, 1);
 
         pass.set_pipeline(&self.compute_draw_agents);
-        pass.dispatch_workgroups(NUM_AGENTS, 1, 1);
+        pass.dispatch_workgroups(NUM_AGENTS / 64, 1, 1);
 
         pass.set_pipeline(&self.compute_dim_texture);
-        pass.dispatch_workgroups(TEXTURE_SIZE, TEXTURE_SIZE, 1);
+        pass.dispatch_workgroups(TEXTURE_WIDTH / 10, TEXTURE_HEIGHT / 10, 1);
 
         pass.set_pipeline(&self.compute_blur_texture);
-        pass.dispatch_workgroups(TEXTURE_SIZE, TEXTURE_SIZE, 1);
+        pass.dispatch_workgroups(TEXTURE_WIDTH / 10, TEXTURE_HEIGHT / 10, 1);
 
         drop(pass);
 
@@ -471,7 +483,7 @@ impl State {
 pub async fn run() {
     env_logger::init();
     let event_loop = EventLoop::new();
-    let window = WindowBuilder::new().with_inner_size(winit::dpi::LogicalSize::new(1024, 1024)).build(&event_loop).unwrap();
+    let window = WindowBuilder::new().with_inner_size(winit::dpi::LogicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT)).build(&event_loop).unwrap();
 
     let mut state = State::new(&window).await;
 
